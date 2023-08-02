@@ -1,3 +1,4 @@
+use actix::{Actor, Message, Context, Handler};
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
@@ -5,7 +6,7 @@ use futures::future;
 use tokio::{stream, time};
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use std::{io::{Error, ErrorKind}, time::{Duration, Instant}};
-use yahoo::time::OffsetDateTime;
+use yahoo::{time::OffsetDateTime, YahooConnector};
 use yahoo_finance_api as yahoo;
 
 #[derive(Parser, Debug)]
@@ -19,6 +20,71 @@ struct Opts {
     symbols: String,
     #[clap(short, long)]
     from: String,
+}
+
+struct DownloadActor {
+    provider: YahooConnector
+}
+
+struct FinanceDataActor {
+
+}
+
+struct PrintActor {
+
+}
+
+struct WriterActor {
+
+}
+
+/// Message for DownloadActor to communicate stock symbols & timeframe
+#[derive(Message)]
+#[rtype(result = "Result<Vec<f64>>, std::io::Error")]
+struct TargetData {
+    symbol: String,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+}
+
+impl Actor for FinanceDataActor {
+    type Context = Context<Self>;
+}
+
+impl Actor for DownloadActor {
+    type Context = Context<Self>;
+    fn started(&mut self, ctx: &mut Self::Context) {
+        self.provider = yahoo::YahooConnector::new();
+    }   
+}
+
+impl Handler<TargetData> for DownloadActor {
+    type Result = Result<Vec<f64>, std::io::Error>;
+
+    fn handle(&mut self, msg: TargetData, ctx: &mut Self::Context) -> Self::Result {
+        let response = self.provider
+            .get_quote_history(&msg.symbol, msg.from, msg.to)
+            .await
+            .map_err(|_| Error::from(ErrorKind::InvalidData))?;
+
+        let mut quotes = response
+            .quotes()
+            .map_err(|_| Error::from(ErrorKind::InvalidData))?;
+        if !quotes.is_empty() {
+            quotes.sort_by_cached_key(|k| k.timestamp);
+            Ok(quotes.iter().map(|q| q.adjclose as f64).collect())
+        } else {
+            Ok(vec![])
+        }
+    } 
+}
+
+impl Actor for PrintActor {
+    type Context = Context<Self>;
+}
+
+impl Actor for WriterActor {
+    type Context = Context<Self>;
 }
 
 ///
@@ -119,56 +185,21 @@ impl AsyncStockSignal for WindowedSMA {
 ///
 /// A tuple `(absolute, relative)` difference.
 ///
-fn price_diff(a: &[f64]) -> Option<(f64, f64)> {
-    if !a.is_empty() {
-        // unwrap is safe here even if first == last
-        let (first, last) = (a.first().unwrap(), a.last().unwrap());
-        let abs_diff = last - first;
-        let first = if *first == 0.0 { 1.0 } else { *first };
-        let rel_diff = abs_diff / first;
-        Some((abs_diff, rel_diff))
-    } else {
-        None
-    }
-}
 
 ///
 /// Window function to create a simple moving average
 ///
-fn n_window_sma(n: usize, series: &[f64]) -> Option<Vec<f64>> {
-    if !series.is_empty() && n > 1 {
-        Some(
-            series
-                .windows(n)
-                .map(|w| w.iter().sum::<f64>() / w.len() as f64)
-                .collect(),
-        )
-    } else {
-        None
-    }
-}
+
 
 ///
 /// Find the maximum in a series of f64
 ///
-fn max(series: &[f64]) -> Option<f64> {
-    if series.is_empty() {
-        None
-    } else {
-        Some(series.iter().fold(f64::MIN, |acc, q: &f64| acc.max(*q)))
-    }
-}
+
 
 ///
 /// Find the minimum in a series of f64
 ///
-fn min(series: &[f64]) -> Option<f64> {
-    if series.is_empty() {
-        None
-    } else {
-        Some(series.iter().fold(f64::MAX, |acc, q: &f64| acc.min(*q)))
-    }
-}
+
 
 ///
 /// Retrieve data from a data source and extract the closing prices. Errors during download are mapped onto io::Errors as InvalidData.
@@ -247,6 +278,10 @@ async fn main() -> std::io::Result<()> {
         symbols = &opts.symbols;
     }
     
+    // start download actors
+    let download_actor = DownloadActor {};
+    let addr_download = download_actor.start();
+
     let mut interval = IntervalStream::new(time::interval(Duration::from_secs(30)));
     println!("period start,symbol,price,change %,min,max,30d avg");
     let symbols: Vec<&str> = symbols.split(",").collect();
