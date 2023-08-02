@@ -3,6 +3,7 @@ use chrono::prelude::*;
 use clap::Parser;
 use futures::future;
 use tokio::{stream, time};
+use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use std::{io::{Error, ErrorKind}, time::{Duration, Instant}};
 use yahoo::time::OffsetDateTime;
 use yahoo_finance_api as yahoo;
@@ -239,13 +240,17 @@ async fn main() -> std::io::Result<()> {
     let to = OffsetDateTime::now_utc();
 
     // store all symbols from file
-    let symbols = include_str!("../sp500.dec.2022.txt");
-
-    let mut interval = time::interval(Duration::from_secs(30));
+    let mut symbols = "";
+    if opts.symbols.is_empty() {
+        symbols = include_str!("../sp500.dec.2022.txt");
+    } else {
+        symbols = &opts.symbols;
+    }
+    
+    let mut interval = IntervalStream::new(time::interval(Duration::from_secs(30)));
     println!("period start,symbol,price,change %,min,max,30d avg");
     let symbols: Vec<&str> = symbols.split(",").collect();
-    while let _ = interval.tick().await {
-        println!("que facemos {:#?}", Utc::now());
+    while let Some(_) = interval.next().await {
         let queries: Vec<_> = symbols.iter()
         .map(|symbol| get_symbol_data(symbol, &from, &to))
         .collect();
