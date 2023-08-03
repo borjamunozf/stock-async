@@ -1,10 +1,8 @@
-use actix::{Actor, Message, Context, Handler};
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
 use futures::future;
-use tokio::{stream, time};
-use tokio_stream::{wrappers::IntervalStream, StreamExt};
+use xactor::{message, Actor, Handler, Context};
 use std::{io::{Error, ErrorKind}, time::{Duration, Instant}};
 use yahoo::{time::OffsetDateTime, YahooConnector};
 use yahoo_finance_api as yahoo;
@@ -39,8 +37,7 @@ struct WriterActor {
 }
 
 /// Message for DownloadActor to communicate stock symbols & timeframe
-#[derive(Message)]
-#[rtype(result = "Result<Vec<f64>>, std::io::Error")]
+#[message(result="std::io::Result<Vec<f64>>")]
 struct TargetData {
     symbol: String,
     from: OffsetDateTime,
@@ -48,25 +45,25 @@ struct TargetData {
 }
 
 impl Actor for FinanceDataActor {
-    type Context = Context<Self>;
 }
 
 impl Actor for DownloadActor {
-    type Context = Context<Self>;
-    fn started(&mut self, ctx: &mut Self::Context) {
-        self.provider = yahoo::YahooConnector::new();
-    }   
+  fn started(&mut self, ctx: &mut Context<Self>) -> xactor::Result<()> {
+    self.provider = YahooConnector::new();
+    Ok(())
+  }
 }
 
+#[async_trait::async_trait]
 impl Handler<TargetData> for DownloadActor {
-    type Result = Result<Vec<f64>, std::io::Error>;
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: TargetData) -> std::io::Result<Vec<f64>> {
+        let provider = yahoo::YahooConnector::new();
 
-    fn handle(&mut self, msg: TargetData, ctx: &mut Self::Context) -> Self::Result {
-        let response = self.provider
+        let response = provider
             .get_quote_history(&msg.symbol, msg.from, msg.to)
             .await
             .map_err(|_| Error::from(ErrorKind::InvalidData))?;
-
+    
         let mut quotes = response
             .quotes()
             .map_err(|_| Error::from(ErrorKind::InvalidData))?;
@@ -76,15 +73,13 @@ impl Handler<TargetData> for DownloadActor {
         } else {
             Ok(vec![])
         }
-    } 
+    }
 }
 
 impl Actor for PrintActor {
-    type Context = Context<Self>;
 }
 
 impl Actor for WriterActor {
-    type Context = Context<Self>;
 }
 
 ///
@@ -263,7 +258,7 @@ async fn get_symbol_data(
     None
 }
 
-#[tokio::main]
+#[xactor::main]
 async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
