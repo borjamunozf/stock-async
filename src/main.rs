@@ -1,11 +1,18 @@
-use async_trait::async_trait;
+mod finance;
+
+use async_std::stream;
 use chrono::prelude::*;
 use clap::Parser;
 use futures::future;
-use xactor::{message, Actor, Handler, Context};
-use std::{io::{Error, ErrorKind}, time::{Duration, Instant}};
+use std::{
+    io::{Error, ErrorKind, BufWriter},
+    time::{Duration}, fs::File,
+};
+use xactor::{message, Actor, Context, Handler, Broker, Service};
 use yahoo::{time::OffsetDateTime, YahooConnector};
 use yahoo_finance_api as yahoo;
+
+use finance::AsyncStockSignal;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -21,158 +28,222 @@ struct Opts {
 }
 
 struct DownloadActor {
-    provider: YahooConnector
+    provider: YahooConnector,
 }
 
-struct FinanceDataActor {
+struct FinanceDataActor {}
 
-}
-
-struct PrintActor {
-
-}
+struct PrintActor {}
 
 struct WriterActor {
-
+    filename: String,
+    writer: BufWriter<File>,
 }
 
 /// Message for DownloadActor to communicate stock symbols & timeframe
-#[message(result="std::io::Result<Vec<f64>>")]
-struct TargetData {
+//#[message(result = "std::io::Result<Vec<f64>>")]
+#[derive(Clone)]
+#[message]
+struct StockDataRequest {
     symbol: String,
     from: OffsetDateTime,
     to: OffsetDateTime,
 }
 
-impl Actor for FinanceDataActor {
+/// Message for FinanceActor to get finance stats for symbol
+//#[message(result = "Option<SymbolFinanceResponse>")]
+#[derive(Clone)]
+#[message]
+struct SymbolFinanceRequest {
+    series: Vec<f64>,
+    symbol: String,
+    from: OffsetDateTime,
 }
 
-impl Actor for DownloadActor {
-  fn started(&mut self, ctx: &mut Context<Self>) -> xactor::Result<()> {
-    self.provider = YahooConnector::new();
-    Ok(())
-  }
+#[derive(Clone)]
+#[message]
+struct SymbolFinanceResponse {
+    symbol: String,
+    last_price: f64,
+    pct_change: f64,
+    period_min: f64,
+    period_max: f64,
+    sma: Vec<f64>,
+}
+
+#[message]
+#[derive(Clone)]
+struct PrintRequest {
+    symbol_data: SymbolFinanceResponse,
+    from: OffsetDateTime,
+}
+
+#[message]
+#[derive(Clone)]
+struct WriteRequest {
+    symbol_data: SymbolFinanceResponse,
+    from: OffsetDateTime,
+}
+
+
+#[async_trait::async_trait]
+impl Actor for FinanceDataActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> xactor::Result<()> {
+        ctx.subscribe::<SymbolFinanceRequest>().await
+      }
 }
 
 #[async_trait::async_trait]
-impl Handler<TargetData> for DownloadActor {
-    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: TargetData) -> std::io::Result<Vec<f64>> {
+impl Actor for DownloadActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> xactor::Result<()> {
+      self.provider = YahooConnector::new();
+      ctx.subscribe::<StockDataRequest>().await
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<StockDataRequest> for DownloadActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        msg: StockDataRequest,
+    ) {
         let provider = yahoo::YahooConnector::new();
 
         let response = provider
             .get_quote_history(&msg.symbol, msg.from, msg.to)
             .await
-            .map_err(|_| Error::from(ErrorKind::InvalidData))?;
-    
+            .map_err(|e| {
+                eprintln!("Error obtaining quote history: {}", e);
+                return
+            }
+            ).unwrap();
+
         let mut quotes = response
             .quotes()
-            .map_err(|_| Error::from(ErrorKind::InvalidData))?;
+            .map_err(|e| {
+                eprintln!("Error obtaining quote history: {}", e);
+                return
+        }).unwrap();
+
+
+        let mut series: Vec<f64> = vec![];
         if !quotes.is_empty() {
             quotes.sort_by_cached_key(|k| k.timestamp);
-            Ok(quotes.iter().map(|q| q.adjclose as f64).collect())
-        } else {
-            Ok(vec![])
+            series = quotes.iter().map(|q| q.adjclose as f64).collect()
+        }
+
+        if let Err(e) = Broker::from_registry().await.unwrap().publish(SymbolFinanceRequest {
+            series,
+            symbol: msg.symbol,
+            from: msg.from,
+        }) {
+            eprintln!("Failed to publish symbol finance req stats: {}", e);
         }
     }
 }
 
+#[async_trait::async_trait]
+impl Handler<SymbolFinanceRequest> for FinanceDataActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        msg: SymbolFinanceRequest,
+    ) {
+        // signals types
+        let max_signal = finance::MaxPrice {};
+        let min_signal = finance::MinPrice {};
+        let pct_diff = finance::PriceDifference {};
+        let window_sma = finance::WindowedSMA { window_size: 30 };
+        if !msg.series.is_empty() {
+            // min/max of the period. unwrap() because those are Option types
+            let period_max = max_signal.calculate(&msg.series).await.unwrap();
+            let period_min = min_signal.calculate(&msg.series).await.unwrap();
+            let last_price = *msg.series.last().unwrap_or(&0.0);
+            let (_, pct_change) = pct_diff.calculate(&msg.series).await.unwrap();
+            let sma = window_sma.calculate(&msg.series).await.unwrap();
+            if let Err(e) = Broker::from_registry().await.unwrap().publish(PrintRequest{
+                symbol_data: 
+                SymbolFinanceResponse {
+                symbol: msg.symbol,
+                last_price,
+                pct_change,
+                period_min,
+                period_max,
+                sma,
+            },
+                from: msg.from
+            }) {
+                eprintln!("Failed to send symbol finance data {}", e);
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
 impl Actor for PrintActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> xactor::Result<()> {
+        ctx.subscribe::<PrintRequest>().await;
+        Ok(())
+      }
 }
 
+#[async_trait::async_trait]
+impl Handler<PrintRequest> for PrintActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        msg: PrintRequest,
+    ) {
+        // a simple way to output CSV data
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            msg.from.time(),
+            msg.symbol_data.symbol,
+            msg.symbol_data.last_price,
+            msg.symbol_data.pct_change,
+            msg.symbol_data.period_min,
+            msg.symbol_data.period_max,
+            msg.symbol_data.sma.last().unwrap_or(&0.0),
+        );
+    }
+}
+
+#[async_trait::async_trait]
 impl Actor for WriterActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> xactor::Result<()> {
+        let mut file = File::create(&self.filename)
+            .unwrap_or_else(|_| panic!("Could not open file"));
+
+        let _ = writeln!(file,"period,symbol,price,change%,min,max,30d-avg");
+
+        self.writer = BufWriter::new(file);
+        ctx.subscribe::<WriteRequest>().await;
+        Ok(())
+      }
 }
 
-///
-/// A trait to provide a common interface for all signal calculations.
-///
-#[async_trait]
-trait AsyncStockSignal {
-    ///
-    /// The signal's data type.
-    ///
-    type SignalType;
-
-    ///
-    /// Calculate the signal on the provided series.
-    ///
-    /// # Returns
-    ///
-    /// The signal (using the provided type) or `None` on error/invalid data.
-    ///
-    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType>;
-}
-
-#[derive(Debug)]
-struct PriceDifference {}
-
-#[derive(Debug, PartialEq)]
-struct MinPrice {}
-
-#[derive(Debug, PartialEq)]
-struct MaxPrice {}
-
-#[derive(Debug, PartialEq)]
-struct WindowedSMA {
-    window_size: u32,
-}
-
-#[async_trait]
-impl AsyncStockSignal for MinPrice {
-    type SignalType = f64;
-
-    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
-        if series.is_empty() {
-            return None;
-        }
-        Some(series.iter().fold(f64::MAX, |acc, q: &f64| acc.min(*q)))
-    }
-}
-#[async_trait]
-impl AsyncStockSignal for MaxPrice {
-    type SignalType = f64;
-
-    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
-        if series.is_empty() {
-            return None;
-        }
-
-        Some(series.iter().fold(f64::MIN, |acc, q: &f64| acc.max(*q)))
+#[async_trait::async_trait]
+impl Handler<WriteRequest> for WriterActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        msg: WriteRequest,
+    ) {
+        // a simple way to output CSV data
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            msg.from.time(),
+            msg.symbol_data.symbol,
+            msg.symbol_data.last_price,
+            msg.symbol_data.pct_change,
+            msg.symbol_data.period_min,
+            msg.symbol_data.period_max,
+            msg.symbol_data.sma.last().unwrap_or(&0.0),
+        );
     }
 }
 
-#[async_trait]
-impl AsyncStockSignal for PriceDifference {
-    type SignalType = (f64, f64);
-
-    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
-        if series.is_empty() {
-            return None;
-        }
-        let (first, last) = (series.first().unwrap(), series.last().unwrap());
-        let abs_diff = last - first;
-        let first = if *first == 0.0 { 1.0 } else { *first };
-        let rel_diff = abs_diff / first;
-        Some((abs_diff, rel_diff))
-    }
-}
-
-#[async_trait]
-impl AsyncStockSignal for WindowedSMA {
-    type SignalType = Vec<f64>;
-
-    async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
-        if series.is_empty() && self.window_size > 1 {
-            return None;
-        }
-
-        Some(
-            series
-                .windows(self.window_size as usize)
-                .map(|w| w.iter().sum::<f64>() / w.len() as f64)
-                .collect(),
-        )
-    }
-}
 ///
 /// Calculates the absolute and relative difference between the beginning and ending of an f64 series. The relative difference is relative to the beginning.
 ///
@@ -185,16 +256,13 @@ impl AsyncStockSignal for WindowedSMA {
 /// Window function to create a simple moving average
 ///
 
-
 ///
 /// Find the maximum in a series of f64
 ///
 
-
 ///
 /// Find the minimum in a series of f64
 ///
-
 
 ///
 /// Retrieve data from a data source and extract the closing prices. Errors during download are mapped onto io::Errors as InvalidData.
@@ -228,10 +296,10 @@ async fn get_symbol_data(
     to: &OffsetDateTime,
 ) -> Option<Vec<f64>> {
     // signals types
-    let max_signal = MaxPrice {};
-    let min_signal = MinPrice {};
-    let pct_diff = PriceDifference {};
-    let window_sma = WindowedSMA { window_size: 30 };
+    let max_signal = finance::MaxPrice {};  
+    let min_signal = finance::MinPrice {};
+    let pct_diff = finance::PriceDifference {};
+    let window_sma = finance::WindowedSMA { window_size: 30 };
     let closes = fetch_closing_data(&symbol, &from, &to).await.ok()?;
     if !closes.is_empty() {
         // min/max of the period. unwrap() because those are Option types
@@ -241,8 +309,8 @@ async fn get_symbol_data(
         let (_, pct_change) = pct_diff.calculate(&closes).await.unwrap();
         let sma = window_sma.calculate(&closes).await.unwrap();
 
-         // a simple way to output CSV data
-         println!(
+        // a simple way to output CSV data
+        println!(
             "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
             from.time(),
             symbol,
@@ -252,7 +320,7 @@ async fn get_symbol_data(
             period_max,
             sma.last().unwrap_or(&0.0)
         );
-        return Some(closes)   
+        return Some(closes);
     }
 
     None
@@ -272,98 +340,36 @@ async fn main() -> std::io::Result<()> {
     } else {
         symbols = &opts.symbols;
     }
-    
-    // start download actors
-    let download_actor = DownloadActor {};
-    let addr_download = download_actor.start();
 
-    let mut interval = IntervalStream::new(time::interval(Duration::from_secs(30)));
+    // start actors
+    let download_actor = DownloadActor {provider: YahooConnector::new()};
+    let finance_actor = FinanceDataActor{};
+    let print_actor = PrintActor{};
+
+    // generate random filename
+    let file_actor = WriterActor{};
+
+    let addr_download = download_actor.start().await;
+    let addr_finance = finance_actor.start().await;
+    let addr_print = print_actor.start().await;
+    //let addr_file = file_actor.start().await();
+
+
+    let mut interval = stream::interval(Duration::from_secs(30));
     println!("period start,symbol,price,change %,min,max,30d avg");
     let symbols: Vec<&str> = symbols.split(",").collect();
     while let Some(_) = interval.next().await {
-        let queries: Vec<_> = symbols.iter()
-        .map(|symbol| get_symbol_data(symbol, &from, &to))
-        .collect();
-
-        let _ = future::join_all(queries).await;
+        for symbol in symbols {
+        if let Err(e) = Broker::from_registry().await?.publish(StockDataRequest {
+            symbol: symbol.to_string(),
+            from,
+            to
+        }) {
+            eprintln!("{}", e);
+            break
+        }
+        }
+        let to = OffsetDateTime::now_utc();
     }
-    
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(non_snake_case)]
-    use super::*;
-
-    #[tokio::test]
-    async fn test_PriceDifference_calculate() {
-        let signal = PriceDifference {};
-        assert_eq!(signal.calculate(&[]).await, None);
-        assert_eq!(signal.calculate(&[1.0]).await, Some((0.0, 0.0)));
-        assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some((-1.0, -1.0)));
-        assert_eq!(
-            signal
-                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
-                .await,
-            Some((8.0, 4.0))
-        );
-        assert_eq!(
-            signal.calculate(&[0.0, 3.0, 5.0, 6.0, 1.0, 2.0, 1.0]).await,
-            Some((1.0, 1.0))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_MinPrice_calculate() {
-        let signal = MinPrice {};
-        assert_eq!(signal.calculate(&[]).await, None);
-        assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
-        assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(0.0));
-        assert_eq!(
-            signal
-                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
-                .await,
-            Some(1.0)
-        );
-        assert_eq!(
-            signal.calculate(&[0.0, 3.0, 5.0, 6.0, 1.0, 2.0, 1.0]).await,
-            Some(0.0)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_MaxPrice_calculate() {
-        let signal = MaxPrice {};
-        assert_eq!(signal.calculate(&[]).await, None);
-        assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
-        assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(1.0));
-        assert_eq!(
-            signal
-                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
-                .await,
-            Some(10.0)
-        );
-        assert_eq!(
-            signal.calculate(&[0.0, 3.0, 5.0, 6.0, 1.0, 2.0, 1.0]).await,
-            Some(6.0)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_WindowedSMA_calculate() {
-        let series = vec![2.0, 4.5, 5.3, 6.5, 4.7];
-
-        let signal = WindowedSMA { window_size: 3 };
-        assert_eq!(
-            signal.calculate(&series).await,
-            Some(vec![3.9333333333333336, 5.433333333333334, 5.5])
-        );
-
-        let signal = WindowedSMA { window_size: 5 };
-        assert_eq!(signal.calculate(&series).await, Some(vec![4.6]));
-
-        let signal = WindowedSMA { window_size: 10 };
-        assert_eq!(signal.calculate(&series).await, Some(vec![]));
-    }
 }
