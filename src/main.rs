@@ -123,7 +123,6 @@ impl Handler<StockDataRequest> for DownloadActor {
             }
         };
 
-        println!("que facemos");
         if let Err(e) = Broker::from_registry()
             .await
             .unwrap()
@@ -141,8 +140,6 @@ impl Handler<StockDataRequest> for DownloadActor {
 #[async_trait::async_trait]
 impl Handler<SymbolFinanceRequest> for FinanceDataActor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, msg: SymbolFinanceRequest) {
-        println!("QUE FACEMOS FINANCE DATA");
-
         // signals types
         let max_signal = finance::MaxPrice {};
         let min_signal = finance::MinPrice {};
@@ -197,6 +194,17 @@ impl Handler<PrintRequest> for PrintActor {
             msg.symbol_data.period_max,
             msg.symbol_data.sma.last().unwrap_or(&0.0),
         );
+
+        if let Err(e) = Broker::from_registry()
+            .await
+            .unwrap()
+            .publish(WriteRequest {
+                symbol_data: msg.symbol_data,
+                from: msg.from,
+            })
+        {
+            eprintln!("failed to send write request {}", e);
+        }
     }
 }
 
@@ -226,16 +234,19 @@ impl Actor for WriterActor {
 impl Handler<WriteRequest> for WriterActor {
     async fn handle(&mut self, _ctx: &mut Context<Self>, msg: WriteRequest) {
         // a simple way to output CSV data
-        println!(
-            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-            msg.from.time(),
-            msg.symbol_data.symbol,
-            msg.symbol_data.last_price,
-            msg.symbol_data.pct_change,
-            msg.symbol_data.period_min,
-            msg.symbol_data.period_max,
-            msg.symbol_data.sma.last().unwrap_or(&0.0),
-        );
+        if let Some(file) = &mut self.writer {
+            let _ = writeln!(
+                file,
+                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+                msg.from.time(),
+                msg.symbol_data.symbol,
+                msg.symbol_data.last_price,
+                msg.symbol_data.pct_change,
+                msg.symbol_data.period_min,
+                msg.symbol_data.period_max,
+                msg.symbol_data.sma.last().unwrap_or(&0.0),
+            );
+        }
     }
 }
 
