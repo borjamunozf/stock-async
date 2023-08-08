@@ -1,14 +1,13 @@
 mod finance;
 
-use async_std::stream;
+use async_std::stream::{self, StreamExt};
 use chrono::prelude::*;
 use clap::Parser;
-use futures::future;
 use std::{
-    io::{Error, ErrorKind, BufWriter},
+    io::{Error, ErrorKind, BufWriter, Write},
     time::{Duration}, fs::File,
 };
-use xactor::{message, Actor, Context, Handler, Broker, Service};
+use xactor::{message, Actor, Context, Handler, Broker, Service, Supervisor};
 use yahoo::{time::OffsetDateTime, YahooConnector};
 use yahoo_finance_api as yahoo;
 
@@ -33,11 +32,12 @@ struct DownloadActor {
 
 struct FinanceDataActor {}
 
+#[derive(Clone)]
 struct PrintActor {}
 
 struct WriterActor {
     filename: String,
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
 }
 
 /// Message for DownloadActor to communicate stock symbols & timeframe
@@ -110,6 +110,8 @@ impl Handler<StockDataRequest> for DownloadActor {
     ) {
         let provider = yahoo::YahooConnector::new();
 
+        println!("QUE FACEMOS prev respons");
+
         let response = provider
             .get_quote_history(&msg.symbol, msg.from, msg.to)
             .await
@@ -118,6 +120,8 @@ impl Handler<StockDataRequest> for DownloadActor {
                 return
             }
             ).unwrap();
+
+         println!("QUE FACEMOS PREV QUOTES");
 
         let mut quotes = response
             .quotes()
@@ -150,6 +154,8 @@ impl Handler<SymbolFinanceRequest> for FinanceDataActor {
         _ctx: &mut Context<Self>,
         msg: SymbolFinanceRequest,
     ) {
+        println!("QUE FACEMOS FINANCE DATA");
+
         // signals types
         let max_signal = finance::MaxPrice {};
         let min_signal = finance::MinPrice {};
@@ -215,12 +221,20 @@ impl Actor for WriterActor {
         let mut file = File::create(&self.filename)
             .unwrap_or_else(|_| panic!("Could not open file"));
 
-        let _ = writeln!(file,"period,symbol,price,change%,min,max,30d-avg");
+        let _ = writeln!(&mut file,"period,symbol,price,change%,min,max,30d-avg");
 
-        self.writer = BufWriter::new(file);
-        ctx.subscribe::<WriteRequest>().await;
-        Ok(())
+        self.writer = Some(BufWriter::new(file));
+        ctx.subscribe::<WriteRequest>().await
       }
+
+    async fn stopped(&mut self, ctx: &mut Context<Self>) {
+        if let Some(writer) = &mut self.writer {
+            writer
+                .flush()
+                .expect("Something happened when flushing. Data loss :(")
+        };
+        ctx.stop(None);
+    }
 }
 
 #[async_trait::async_trait]
@@ -327,39 +341,36 @@ async fn get_symbol_data(
 }
 
 #[xactor::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> xactor::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
     let from: OffsetDateTime = OffsetDateTime::from_unix_timestamp(from.timestamp()).unwrap();
-    let to = OffsetDateTime::now_utc();
+    let mut to = OffsetDateTime::now_utc();
 
     // store all symbols from file
     let mut symbols = "";
     if opts.symbols.is_empty() {
         symbols = include_str!("../sp500.dec.2022.txt");
-    } else {
+    } else {    
         symbols = &opts.symbols;
     }
 
-    // start actors
-    let download_actor = DownloadActor {provider: YahooConnector::new()};
-    let finance_actor = FinanceDataActor{};
-    let print_actor = PrintActor{};
-
-    // generate random filename
-    let file_actor = WriterActor{};
-
-    let addr_download = download_actor.start().await;
-    let addr_finance = finance_actor.start().await;
-    let addr_print = print_actor.start().await;
-    //let addr_file = file_actor.start().await();
+    // init actors
+    let _downloader = Supervisor::start(|| DownloadActor {provider: YahooConnector::new()}).await;
+    let _finance_actor = Supervisor::start(|| FinanceDataActor{}).await;
+    let _print_act = Supervisor::start(|| PrintActor{}).await;
+    let _writer_act = Supervisor::start(|| WriterActor {
+        filename: format!("{}.csv", Utc::now().to_rfc2822()), // create a unique file name every time
+        writer: None,
+    })
+    .await;
 
 
     let mut interval = stream::interval(Duration::from_secs(30));
     println!("period start,symbol,price,change %,min,max,30d avg");
-    let symbols: Vec<&str> = symbols.split(",").collect();
+    let symbols: Vec<&str> = symbols.split(",").to_owned().collect();
     while let Some(_) = interval.next().await {
-        for symbol in symbols {
+        for symbol in &symbols {
         if let Err(e) = Broker::from_registry().await?.publish(StockDataRequest {
             symbol: symbol.to_string(),
             from,
@@ -369,7 +380,7 @@ async fn main() -> std::io::Result<()> {
             break
         }
         }
-        let to = OffsetDateTime::now_utc();
+        to = OffsetDateTime::now_utc();
     }
     Ok(())
 }

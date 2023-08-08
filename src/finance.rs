@@ -31,7 +31,7 @@ pub struct MaxPrice {}
 
 #[derive(Debug, PartialEq)]
 pub struct WindowedSMA {
-    window_size: u32,
+    pub window_size: u32,
 }
 
 #[async_trait]
