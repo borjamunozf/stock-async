@@ -1,14 +1,16 @@
 mod finance;
 
 use async_std::stream::{self, StreamExt};
+use axum::{Router, extract::{Path, State}, response::IntoResponse, routing::get, Json, http::StatusCode};
 use chrono::prelude::*;
 use clap::Parser;
+use serde::{Serialize, Deserialize};
 use std::{
     fs::File,
     io::{BufWriter, Error, ErrorKind, Write},
-    time::Duration,
+    time::Duration, net::SocketAddr, collections::VecDeque,
 };
-use xactor::{message, Actor, Broker, Context, Handler, Service, Supervisor};
+use xactor::{message, Actor, Broker, Context, Handler, Service, Supervisor, Addr};
 use yahoo::{time::OffsetDateTime, YahooConnector};
 use yahoo_finance_api as yahoo;
 
@@ -61,7 +63,7 @@ struct SymbolFinanceRequest {
     from: OffsetDateTime,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 #[message]
 struct SymbolFinanceResponse {
     symbol: String,
@@ -250,6 +252,31 @@ impl Handler<WriteRequest> for WriterActor {
     }
 }
 
+struct SignalBufferActor {
+    signal_buffer: VecDeque<SymbolFinanceResponse>
+}
+
+
+#[message]
+#[derive(Clone)]
+struct SignalBufferRequest {
+    n_signal: u32
+}
+
+#[async_trait::async_trait]
+impl Actor for SignalBufferActor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> xactor::Result<()> {
+        ctx.subscribe::<SignalBufferRequest>().await
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<SignalBufferRequest> for SignalBufferActor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: SignalBufferRequest) -> xactor::Result<VecDeque<SymbolFinanceResponse>> {
+
+    }
+}
+
 ///
 /// Calculates the absolute and relative difference between the beginning and ending of an f64 series. The relative difference is relative to the beginning.
 ///
@@ -270,67 +297,22 @@ impl Handler<WriteRequest> for WriterActor {
 /// Find the minimum in a series of f64
 ///
 
-///
-/// Retrieve data from a data source and extract the closing prices. Errors during download are mapped onto io::Errors as InvalidData.
-///
-async fn fetch_closing_data(
-    symbol: &str,
-    beginning: &OffsetDateTime,
-    end: &OffsetDateTime,
-) -> std::io::Result<Vec<f64>> {
-    let provider = yahoo::YahooConnector::new();
 
-    let response = provider
-        .get_quote_history(symbol, *beginning, *end)
-        .await
-        .map_err(|_| Error::from(ErrorKind::InvalidData))?;
-
-    let mut quotes = response
-        .quotes()
-        .map_err(|_| Error::from(ErrorKind::InvalidData))?;
-    if !quotes.is_empty() {
-        quotes.sort_by_cached_key(|k| k.timestamp);
-        Ok(quotes.iter().map(|q| q.adjclose as f64).collect())
-    } else {
-        Ok(vec![])
+async fn get_signals(Path(n): Path<u32>, State(buffer): State<Addr<SignalBufferActor>>) -> impl IntoResponse {
+    println!("request for last {} signals", &n);
+    let response = buffer.call(SignalBufferRequest { n_signal: n }).await;
+    match response {
+        Ok(r) => {
+            Json(r);
+        },
+        Err(e) => {
+            StatusCode::INTERNAL_SERVER_ERROR;
+        }
     }
 }
 
-async fn get_symbol_data(
-    symbol: &str,
-    from: &OffsetDateTime,
-    to: &OffsetDateTime,
-) -> Option<Vec<f64>> {
-    // signals types
-    let max_signal = finance::MaxPrice {};
-    let min_signal = finance::MinPrice {};
-    let pct_diff = finance::PriceDifference {};
-    let window_sma = finance::WindowedSMA { window_size: 30 };
-    let closes = fetch_closing_data(&symbol, &from, &to).await.ok()?;
-    if !closes.is_empty() {
-        // min/max of the period. unwrap() because those are Option types
-        let period_max = max_signal.calculate(&closes).await.unwrap();
-        let period_min = min_signal.calculate(&closes).await.unwrap();
-        let last_price = *closes.last().unwrap_or(&0.0);
-        let (_, pct_change) = pct_diff.calculate(&closes).await.unwrap();
-        let sma = window_sma.calculate(&closes).await.unwrap();
 
-        // a simple way to output CSV data
-        println!(
-            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-            from.time(),
-            symbol,
-            last_price,
-            pct_change * 100.0,
-            period_min,
-            period_max,
-            sma.last().unwrap_or(&0.0)
-        );
-        return Some(closes);
-    }
-
-    None
-}
+const BUFFER_SIZE: usize = 200;
 
 #[xactor::main]
 async fn main() -> xactor::Result<()> {
@@ -359,6 +341,20 @@ async fn main() -> xactor::Result<()> {
         writer: None,
     })
     .await;
+
+    let buffer_act = Supervisor::start(|| SignalBufferActor {
+        signal_buffer: VecDeque::with_capacity(BUFFER_SIZE),
+    })
+    .await?;
+
+    // spawn server to expose 
+    let app = Router::new().route("/tail/:n", get(get_signals)).with_state(buffer_act.clone());
+    let addr = SocketAddr::from(([127,0,0,1], 3000)) ;
+    axum::Server::bind(&addr)
+          .serve(app.into_make_service())
+          .await
+          .unwrap();
+  
 
     let mut interval = stream::interval(Duration::from_secs(30));
     println!("period start,symbol,price,change %,min,max,30d avg");
